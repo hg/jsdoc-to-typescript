@@ -1,0 +1,23 @@
+{
+  "name": "jsdoc-to-ts",
+  "version": "1.0.0",
+  "description": "Move JSDoc type annotations in .ts/.mts files into native TypeScript annotations",
+  "main": "./jsdoc-to-ts.mjs",
+  "bin": {
+    "jsdoc-to-ts": "./jsdoc-to-ts.mjs"
+  },
+  "scripts": {
+    "check": "node jsdoc-to-ts.mjs check",
+    "convert": "node jsdoc-to-ts.mjs convert",
+    "files": "node jsdoc-to-ts.mjs files",
+    "test": "node --test test/"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "0BSD",
+  "type": "module",
+  "dependencies": {
+    "@babel/parser": "^7.29.9",
+    "@babel/traverse": "^8.0.6"
+  }
+}
