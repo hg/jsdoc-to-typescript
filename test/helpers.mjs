@@ -11,6 +11,12 @@ export const TOOL = join(
   "jsdoc-to-ts.mjs",
 );
 
+export const TOOLS = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "tools",
+);
+
 /**
  * Creates a temp tree from fixtures and runs the tool. `<DIR>` inside any
  * argument is replaced with the tree root.
@@ -30,6 +36,42 @@ export function run(args, fixtures = {}) {
   return { ...runIn(resolved), dir };
 }
 
+/**
+ * Runs a helper tool with explicit arguments and no fixture setup.
+ * @param {string} script file name under tools/, e.g. "tsfix.mjs"
+ * @param {string[]} args CLI arguments after the script path
+ * @returns {{status: number, stdout: string, stderr: string, output: string}}
+ *   exit code, streams and their concatenation
+ */
+export function runToolIn(script, args) {
+  const proc = spawnSync(process.execPath, [join(TOOLS, script), ...args], {
+    encoding: "utf8",
+  });
+  const stdout = proc.stdout ?? "";
+  const stderr = proc.stderr ?? "";
+  return { status: proc.status, stdout, stderr, output: `${stdout}${stderr}` };
+}
+
+/**
+ * Creates a temp tree from fixtures and runs a helper tool. `<DIR>` inside
+ * any argument and any fixture text is replaced with the tree root, so tsc
+ * logs and snapshots can reference absolute fixture paths.
+ * @param {string} script file name under tools/, e.g. "tsfix.mjs"
+ * @param {string[]} args CLI arguments after the script path
+ * @param {Record<string, string>} fixtures relative path to file text
+ * @returns {{status: number, stdout: string, stderr: string, output: string, dir: string}}
+ *   exit code, streams, their concatenation, and the tree root
+ */
+export function runTool(script, args, fixtures = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "jsdoc-tools-"));
+  for (const [rel, text] of Object.entries(fixtures)) {
+    const full = join(dir, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, text.split("<DIR>").join(dir));
+  }
+  const resolved = args.map((a) => a.split("<DIR>").join(dir));
+  return { ...runToolIn(script, resolved), dir };
+}
 /**
  * Runs the tool with explicit arguments and no fixture setup.
  * @param {string[]} args CLI arguments after the script path
