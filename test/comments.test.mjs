@@ -86,7 +86,7 @@ export function f(parse?: ((value: string) => Promise<unknown>|unknown)|undefine
     );
   });
 
-  it("excludes typedef, callback and overload blocks", () => {
+  it("converts typedef and callback blocks, still excludes overloads", () => {
     const { dir } = run(["convert", "<DIR>"], {
       "a.ts": `/**
  * Row map.
@@ -110,7 +110,7 @@ export function take(value) {
 `,
     });
     const out = read(dir, "a.ts");
-    assert.match(out, /@typedef \{Record<string, number>\} RowMap/);
+    assert.match(out, /type RowMap = Record<string, number>;/);
     assert.match(out, /@overload/);
     assert.match(out, /@param \{string\} text words/);
     assert.match(out, /function take\(value: string\|number\): string/);

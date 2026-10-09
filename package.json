@@ -16,8 +16,10 @@
   "author": "",
   "license": "0BSD",
   "type": "module",
-  "dependencies": {
+  "devDependencies": {
+    "@babel/generator": "^8.0.6",
     "@babel/parser": "^7.29.9",
-    "@babel/traverse": "^8.0.6"
+    "@babel/traverse": "^8.0.6",
+    "@babel/types": "^8.0.6"
   }
 }

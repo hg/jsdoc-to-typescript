@@ -27,25 +27,54 @@
 ///                             under `[key: string]: unknown`. The same shape
 ///                             is built for a plain parameter documented only
 ///                             by sub-tags.
+///   JSDoc spellings           `*` means `any`, `Object` means `object`,
+///                             `Array.<T>`/`Object<K, V>` spell the TS
+///                             generics, `function(A, B): R` becomes a function
+///                             type, capitalized primitives mean primitives,
+///                             `?T`/`T?` mark `| null`. Anything else keeps its
+///                             JSDoc spelling.
+///   `@this {T}`               `this: T` first parameter of functions and
+///                             methods; never on arrows, constructors, getters
+///                             and setters
+///   statement callback docs   a block above a bare call with a single
+///                             function argument documents that argument when
+///                             every `@param` name matches one of its
+///                             parameters (validator-style registrations)
 ///   `@returns {R}`            `: R` on functions, methods and arrows; never
-///                             on constructors and setters
+///                             on constructors and setters; `this` returns on
+///                             methods
 ///   `@type {T}`               `: T` on a single-declarator variable and on
-///                             a class field
+///                             a class field; `value as T` on an object
+///                             property value
+///   `/** @type {T} */ (expr)` `expr as T` (`as const` for `{const}`); a cast
+///                             addressing a parenthesized group lands after
+///                             its closing paren, anything else wraps the
+///                             whole subject in parentheses
 ///   `/** @type {T} */ name`   leading comment of a still untyped parameter
 ///                             becomes `name: T`
+///   `@typedef`/`@callback`    `interface` for object shapes (same-name
+///                             interfaces merge across global scripts),
+///                             `type` for the rest; blocks inside class bodies
+///                             move before the class
+///   `this.x = ...`            `declare x: T` field at the top of the class,
+///                             typed from a hanging `@type`, the assigned
+///                             parameter, a `new` expression or a literal
+///                             (`null` initializers defer to later values,
+///                             anything else is evolving `any` as in checkJs);
+///                             `declare` emits no code, so behavior never
+///                             changes
 ///   `@template ...`           `<T>`, `<T = D>`, `<T extends C = D>` on
 ///                             functions, arrows, methods and classes; an
 ///                             `unknown` constraint is dropped
 ///   A declaration that already carries the annotation is never touched.
 ///
 /// WHAT IT SKIPS (left in place and counted in the summary)
-///   blocks with `@typedef`, `@callback` or `@overload`: they declare their
-///   own types, the implementation docblock is converted on its own
-///   a type that does not parse as TypeScript: the tag is left verbatim
+///   blocks with `@overload`: they declare alternate signatures, the
+///   implementation docblock is converted on its own
+///   a type that does not parse as TypeScript (even after JSDoc mapping):
+///   the tag is left verbatim
 ///   a `@param` name matching no declared parameter, dotted names deeper
 ///   than one level (`opts.nested.key`), nested patterns in parameters
-///   inline casts `/** @type {T} */ (expr)`: rewriting them as `as T` can fail
-///   tsc where JSDoc lied, so they stay comments for a human to convert
 ///   `*.d.ts` files: already declarations, their JSDoc is documentation
 ///   files using decorators: Babel parses them only with an extra plugin,
 ///   so they are reported unparsable and left untouched
@@ -56,16 +85,20 @@
 ///   edits overlap is reported and left untouched.
 ///
 /// WORKFLOW
-///   Converted types keep their JSDoc spelling, which formatters may restyle
-///   once it becomes code (`number|null` wants spaces), so run the formatter
-///   after converting, then the compiler:
+///   Converted types keep their JSDoc spelling except for the legacy forms
+///   above, which formatters may restyle once they become code
+///   (`number|null` wants spaces), so run the formatter after converting,
+///   then the compiler:
 ///     node jsdoc-to-ts.mjs convert ./src
 ///     tsc --noEmit -p tsconfig.json
 ///   tsc errors must drop overall. New errors are surfaced intent, not
-///   damage: names from `@typedef` (convert the typedef next) and uses that
-///   only checked because a parameter stopped being `any` (narrow the code
-///   or fix the docs). If a file gains errors you disagree with, revert it,
-///   fix the JSDoc, and convert again: the tool is idempotent.
+///   damage: uses that only checked because a parameter stopped being `any`
+///   (narrow the code or fix the docs). If a file gains errors you disagree
+///   with, revert it, fix the JSDoc, and convert again: the tool is
+///   idempotent. Mechanical leftovers go through the tools pipeline:
+///   `tools/tsdup.mjs` for same-name globals across page scripts (TS2393),
+///   `tools/tsfix.mjs` to a fixpoint for cast overlap (TS2352), bad annotated
+///   initializers (TS2322), untyped parameters (TS7006) and catch variables.
 ///
 /// COMMANDS
 ///   check <path> [filter...]  (default) one line per pending annotation,
@@ -284,6 +317,101 @@ function decodeName(raw) {
   };
 }
 
+/**
+ * Splits on a separator ignoring nesting and strings.
+ * @param {string} s text
+ * @param {string} sep separator char
+ * @returns {string[]} parts
+ */
+function splitTop(s, sep) {
+  const out = [];
+  let depth = 0;
+  let inStr = null;
+  let cur = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr !== null) {
+      cur += c;
+      if (c === inStr && s[i - 1] !== "\\") inStr = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      inStr = c;
+      cur += c;
+      continue;
+    }
+    if (c === "<" || c === "(" || c === "{" || c === "[") depth++;
+    else if (c === ">" || c === ")" || c === "}" || c === "]") depth--;
+    if (c === sep && depth === 0) {
+      out.push(cur);
+      cur = "";
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Maps a JSDoc type string to TypeScript syntax: `*` means `any`, a bare
+ * `Object` means `object`, `Array.<T>`/`Object<K, V>` spell the TS generics,
+ * `function(A, B): R` becomes a function type, capitalized primitives mean
+ * primitives, and `?T`/`T?`/`T=` mark nullability. Returns null when the
+ * construct is unknown: the tag stays JSDoc for the manual pass.
+ * @param {string} raw JSDoc type text
+ * @returns {string|null} TS type text, or null when unmappable
+ */
+function mapJsType(raw) {
+  let s = raw.trim();
+  if (s === "") return null;
+  // Rest element: ...T -> (T)[] (callers on rest positions strip the marker
+  // themselves; a `...` surviving here still maps so tuple literals convert).
+  let rest = false;
+  if (s.startsWith("...")) {
+    rest = true;
+    s = s.slice(3);
+  }
+  // Nullable / optional markers.
+  let suffix = "";
+  if (s.startsWith("?")) {
+    s = s.slice(1);
+    suffix = " | null";
+  } else if (s.endsWith("?") && !s.endsWith("??")) {
+    s = s.slice(0, -1);
+    suffix = " | null";
+  } else if (s.endsWith("=")) {
+    s = s.slice(0, -1);
+    suffix = " | undefined";
+  }
+  if (s === "*") s = "any";
+  else if (s === "Object") s = "object";
+  else {
+    s = s.replace(/^Array\.<([\s\S]+)>$/, "Array<$1>");
+    s = s.replace(/^Object<([\s\S]+?)>$/, "Record<$1>");
+    // function(A, B): R -> (arg0: A, arg1: B) => R
+    const fn = s.match(/^function\s*\(([\s\S]*)\)\s*:\s*([\s\S]+)$/);
+    if (fn) {
+      const parts = splitTop(fn[1], ",");
+      const params = parts
+        .filter((p) => p.trim() !== "")
+        .map((p, i) => {
+          const pm = p.trim().match(/^([A-Za-z_$][\w$]*)\s*:\s*([\s\S]+)$/);
+          if (pm) return `${pm[1]}: ${pm[2]}`;
+          return `arg${i}: ${p.trim()}`;
+        });
+      s = `(${params.join(", ")}) => ${fn[2].trim()}`;
+    }
+    // Capitalized primitives mean primitives in this tree.
+    s = s.replace(/\bString\b/g, "string");
+    s = s.replace(/\bNumber\b/g, "number");
+    s = s.replace(/\bBoolean\b/g, "boolean");
+  }
+  if (suffix !== "") s = `(${s})${suffix}`;
+  if (rest) s = `(${s})[]`;
+  return validType(s) ? s : null;
+}
+
 const typeCache = new Map();
 
 /**
@@ -324,6 +452,43 @@ function validReturnType(text) {
     return false;
   }
   return true;
+}
+
+/**
+ * Whether a JSDoc type string parses as a method return annotation.
+ * `this` types only exist on members, so the alias-position check rejects
+ * them even when the documented symbol is a method.
+ * @param {string} text candidate type text
+ * @returns {boolean} true when usable after a method parameter list
+ */
+function validMethodReturnType(text) {
+  try {
+    parse(`class __C__ { __m(): ${text.trim()}; }`, {
+      plugins: ["typescript"],
+    });
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Resolves a `@returns` type to the text to insert: the mapped spelling when
+ * the JSDoc form translates, otherwise the verbatim spelling when it parses
+ * in return position (predicates like `x is string`, or `this` on methods).
+ * @param {string} raw type text as written in braces
+ * @param {string} kind function kind from fnKind()
+ * @returns {string|null} annotation text, or null when unusable
+ */
+function mapReturnType(raw, kind) {
+  const mapped = mapJsType(raw);
+  if (mapped !== null) return mapped;
+  const text = raw.trim();
+  if (validReturnType(raw)) return text;
+  if ((kind === "method" || kind === "get") && validMethodReturnType(raw)) {
+    return text;
+  }
+  return null;
 }
 
 /**
@@ -502,7 +667,12 @@ function matchTemplateItem(text, from) {
       }
     }
     def = cleanTypeText(text.slice(start, p));
-    if (def === "" || !validType(def)) return null;
+    if (def === "") return null;
+    // A legacy JSDoc spelling in a default converts to its TS form; an
+    // unmappable one keeps the whole tag out of the conversion
+    const mappedDef = mapJsType(def) ?? (validType(def) ? def : null);
+    if (mappedDef === null) return null;
+    def = mappedDef;
     while (p < text.length && /\s/.test(text[p])) p++;
   }
   if (bracket) {
@@ -528,7 +698,13 @@ function parseTemplate(text) {
     const b = readBraced(text, p);
     if (b === null) return null;
     constraint = cleanTypeText(text.slice(p + 1, b.end - 1));
-    if (constraint !== "" && !validType(constraint)) return null;
+    if (constraint !== "") {
+      const mappedConstraint =
+        mapJsType(constraint) ??
+        (validType(constraint) ? constraint : null);
+      if (mappedConstraint === null) return null;
+      constraint = mappedConstraint;
+    }
     p = b.end;
     while (p < text.length && /\s/.test(text[p])) p++;
   }
@@ -598,6 +774,465 @@ function ownerDoc(path) {
   const usable = found.filter((c) => !EXCLUDED_BLOCK.test(c.value));
   usable.sort((a, b) => b.start - a.start);
   return usable.length > 0 ? usable[0] : null;
+}
+
+/**
+ * Names bound by function parameters, for matching docblock tags.
+ * @param {object[]} params parameter nodes
+ * @returns {Set<string>} identifier names
+ */
+function declaredParamNames(params) {
+  const names = new Set();
+  const walkP = (n) => {
+    if (!n || typeof n !== "object") return;
+    if (n.type === "Identifier") {
+      names.add(n.name);
+      return;
+    }
+    if (n.type === "AssignmentPattern") {
+      walkP(n.left);
+      return;
+    }
+    if (n.type === "RestElement") {
+      walkP(n.argument);
+      return;
+    }
+    if (n.type === "ObjectPattern") {
+      for (const p of n.properties) walkP(p.value ?? p.argument);
+      return;
+    }
+    if (n.type === "ArrayPattern") {
+      for (const e of n.elements) walkP(e);
+    }
+  };
+  for (const p of params ?? []) walkP(p);
+  return names;
+}
+
+/**
+ * Docblock of a bare call statement for its lone function argument.
+ * Registrations document the callback above the whole statement
+ * (`$.validator.addMethod("name", (value, ...) => ...)`), where neither the
+ * function nor the call owns the block. Applies only when the call takes
+ * exactly one function argument and carries at least one `@param` tag with
+ * every named parameter matching a declared parameter, so a block describing
+ * the call itself (e.g. above `fetch(url).then((r) => ...)`) never leaks onto
+ * an argument.
+ * @param {FileConvert} file conversion state
+ * @param {object} path Babel path of the function-like node
+ * @returns {object|null} comment node, or null when nothing applies
+ */
+function statementCallbackDoc(file, path) {
+  const parent = path.parentPath;
+  if (parent === null) return null;
+  if (parent.type !== "CallExpression" && parent.type !== "NewExpression") {
+    return null;
+  }
+  const fns = parent.node.arguments.filter(
+    (a) =>
+      a.type === "FunctionExpression" ||
+      a.type === "ArrowFunctionExpression",
+  );
+  if (fns.length !== 1 || fns[0] !== path.node) return null;
+  const stmt = parent.parentPath;
+  if (stmt === null || stmt.type !== "ExpressionStatement") return null;
+  const blocks = (stmt.node.leadingComments ?? []).filter(
+    (c) =>
+      c.type === "CommentBlock" &&
+      c.value.trimStart().startsWith("*") &&
+      !EXCLUDED_BLOCK.test(c.value),
+  );
+  if (blocks.length === 0) return null;
+  const comment = blocks[blocks.length - 1];
+  const { tags } = docTags(file, comment);
+  const usable = tags.filter(
+    (t) => !file.consumedTags.has(`${comment.start}:${t.at}`),
+  );
+  const paramTags = usable.filter(
+    (t) =>
+      (t.kind === "param" || t.kind === "arg" || t.kind === "argument") &&
+      t.brace !== null,
+  );
+  if (paramTags.length === 0) return null;
+  const declared = declaredParamNames(path.node.params);
+  for (const t of paramTags) {
+    if (!declared.has(decodeName(t.rawName).top)) return null;
+  }
+  return comment;
+}
+
+/**
+ * End offset (exclusive) of the paren group opening at `open`, skipping over
+ * string literals. -1 when unbalanced.
+ * @param {string} src file text
+ * @param {number} open offset of `(`
+ * @returns {number} offset just past the matching `)`, or -1
+ */
+function groupEnd(src, open) {
+  let depth = 0;
+  let str = null;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (str !== null) {
+      if (c === "\\") i++;
+      else if (c === str) str = null;
+      continue;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      str = c;
+      continue;
+    }
+    if (c === "(") depth++;
+    else if (c === ")") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Whether a subject is a `this.name = ...` statement at the top level of a
+ * class method body: the declare-field pass owns those, not the cast pass.
+ * @param {object} path Babel path of the comment-owning node
+ * @param {object} subject expression the cast would address
+ * @returns {boolean} true when the declare-field pass owns it
+ */
+function isTopLevelThisAssign(path, subject) {
+  if (
+    subject.type !== "AssignmentExpression" ||
+    subject.operator !== "=" ||
+    path.node.type !== "ExpressionStatement"
+  ) {
+    return false;
+  }
+  const l = subject.left;
+  if (
+    l.type !== "MemberExpression" ||
+    l.object.type !== "ThisExpression" ||
+    l.computed ||
+    l.property.type !== "Identifier"
+  ) {
+    return false;
+  }
+  const body = path.parentPath;
+  if (body === null || body.type !== "BlockStatement") return false;
+  const method = body.parentPath;
+  if (method === null) return false;
+  return (
+    method.type === "ClassMethod" || method.type === "ClassPrivateMethod"
+  );
+}
+
+/**
+ * Nearest enclosing symbol for the report.
+ * @param {object} path Babel path
+ * @returns {string} display name
+ */
+function enclosingSymbol(path) {
+  let p = path;
+  while (p !== null) {
+    const n = p.node;
+    if (
+      n.type === "FunctionDeclaration" ||
+      n.type === "FunctionExpression" ||
+      n.type === "ArrowFunctionExpression" ||
+      n.type === "ClassMethod" ||
+      n.type === "ClassPrivateMethod" ||
+      n.type === "ObjectMethod"
+    ) {
+      return `${fnName(n)} (${fnKind(n)})`;
+    }
+    if (n.type === "ClassDeclaration" || n.type === "ClassExpression") {
+      return `${n.id !== null ? n.id.name : "(anonymous)"} (class)`;
+    }
+    if (n.type === "VariableDeclarator" && n.id.type === "Identifier") {
+      return `${n.id.name} (variable)`;
+    }
+    p = p.parentPath;
+  }
+  return "(top level)";
+}
+
+/**
+ * Consumes a cast comment: a lone tag vanishes with its comment, prose
+ * around the tag survives as an ordinary comment.
+ * @param {FileConvert} file conversion state
+ * @param {object} comment owning comment node
+ * @param {object} tag parsed `@type` tag
+ * @returns {void}
+ */
+function consumeCastComment(file, comment, tag) {
+  if (tag.descEmpty) {
+    file.removeComment(comment);
+    file.cleanedTags++;
+  } else {
+    cleanTypeTag(file, comment, tag, true, comment.start + 2, comment.end - 2);
+  }
+}
+
+/**
+ * Converts leading single-purpose `/** @type {T} *\/` comments into `as T`
+ * assertions. Pure insertions (plus comment cleanup), so runtime code never
+ * changes: wrapping adds parentheses, and a cast addressing a parenthesized
+ * group lands right after its closing paren.
+ * @param {FileConvert} file conversion state
+ * @param {object} path Babel path of the comment-owning node
+ * @returns {void}
+ */
+function convertCasts(file, path) {
+  const node = path.node;
+  if (
+    node.leadingComments === null ||
+    node.leadingComments === undefined ||
+    node.type === "DirectiveLiteral" ||
+    node.type === "VariableDeclarator" ||
+    node.type === "VariableDeclaration" ||
+    node.type === "FunctionDeclaration" ||
+    node.type === "ClassDeclaration" ||
+    node.type === "ClassProperty" ||
+    node.type === "ClassPrivateProperty" ||
+    node.type === "ObjectProperty" ||
+    node.type === "ClassMethod" ||
+    node.type === "ClassPrivateMethod" ||
+    node.type === "ObjectMethod" ||
+    node.type === "ExportNamedDeclaration" ||
+    node.type === "ExportDefaultDeclaration"
+  ) {
+    return;
+  }
+  // Single-purpose cast comments only: documented declarations keep theirs
+  // (a `@type` next to `@param` annotates a function value, not a cast).
+  const candidates = [];
+  for (const c of node.leadingComments) {
+    if (c.type !== "CommentBlock" || !c.value.trimStart().startsWith("*")) {
+      continue;
+    }
+    if (EXCLUDED_BLOCK.test(c.value)) continue;
+    const inner = parseTags(
+      file.src.slice(c.start + 2, c.end - 2),
+      c.start + 2,
+    );
+    if (inner.length === 1 && inner[0].kind === "type") {
+      candidates.push({ comment: c, tag: inner[0] });
+    }
+  }
+  if (candidates.length === 0) return;
+  let subject =
+    node.type === "ExpressionStatement"
+      ? node.expression
+      : node.type === "ReturnStatement" || node.type === "ThrowStatement"
+        ? node.argument
+        : node;
+  if (!subject) return;
+  // Function values take `@type` as their annotation, handled (or left) by
+  // the declaration passes; a cast on them would bind the wrong node.
+  if (
+    subject.type === "FunctionExpression" ||
+    subject.type === "ArrowFunctionExpression"
+  ) {
+    return;
+  }
+  if (isTopLevelThisAssign(path, subject)) return;
+  // Binding positions, keys and declarator ids never cast.
+  const parent = path.parent;
+  if (parent) {
+    if (
+      parent.type === "ObjectProperty" &&
+      parent.key === subject &&
+      !parent.computed
+    ) {
+      return;
+    }
+    if (
+      (parent.type === "ClassMethod" ||
+        parent.type === "ClassPrivateMethod" ||
+        parent.type === "ObjectMethod") &&
+      parent.key === subject
+    ) {
+      return;
+    }
+    if (
+      parent.type === "MemberExpression" &&
+      parent.property === subject &&
+      !parent.computed
+    ) {
+      return;
+    }
+    if (parent.type === "VariableDeclarator" && parent.id === subject) {
+      return;
+    }
+    if (
+      (parent.type === "FunctionDeclaration" ||
+        parent.type === "FunctionExpression" ||
+        parent.type === "ArrowFunctionExpression" ||
+        parent.type === "ClassMethod" ||
+        parent.type === "ClassPrivateMethod" ||
+        parent.type === "ObjectMethod") &&
+      (parent.params ?? []).includes(subject)
+    ) {
+      return;
+    }
+  }
+  const t = subject.type;
+  if (
+    !(
+      t.endsWith("Expression") ||
+      t.endsWith("Literal") ||
+      t === "TemplateLiteral" ||
+      t === "Identifier"
+    )
+  ) {
+    return;
+  }
+  const wrapsOperand =
+    t === "AssignmentExpression" ||
+    t === "SequenceExpression" ||
+    t === "YieldExpression" ||
+    t === "AwaitExpression";
+  const symbol = enclosingSymbol(path);
+  const wraps = [];
+  for (const { comment, tag } of candidates) {
+    const ckey = `${comment.start}:${tag.at}`;
+    if (file.consumedTags.has(ckey)) continue;
+    let mapped;
+    if (tag.brace !== null) {
+      if (tag.brace.text.trim() === "const") {
+        mapped = "const";
+      } else {
+        mapped = mapJsType(tag.brace.text);
+      }
+    } else {
+      // Bare `@type Name`: checkJs reads the type to the end of the comment.
+      const rest = file.src.slice(tag.at + "@type".length, tag.end).trim();
+      if (!/^[A-Za-z_$]/.test(rest)) continue;
+      mapped = mapJsType(rest);
+    }
+    if (mapped === null) {
+      file.leave("invalid-type");
+      continue;
+    }
+    const asText = mapped === "const" ? " as const" : ` as ${mapped}`;
+    // A cast addresses the parenthesized group right after it: when that
+    // group is narrower than the subject (`/** @type */ (el).files`), when
+    // it holds another cast (`/** {A} */ (/** {B} */ (x))` nests as
+    // `((x as B) as A)`), or when the subject would misbind a wrap (an
+    // assignment casts its whole group cleanly), the group itself is
+    // wrapped: appending `as T` after the group would glue a following
+    // `.member` onto the type (`X as T.prop` reads `T.prop` as the type).
+    // Anything else wraps the whole subject. Extra parentheses either way;
+    // identical runtime.
+    let j = comment.end;
+    while (j < file.src.length && /\s/.test(file.src[j])) j++;
+    if (file.src[j] === "(") {
+      const g = groupEnd(file.src, j);
+      if (g !== -1) {
+        const narrower = subject.end > g;
+        const nested =
+          !narrower && file.src.slice(j, g).includes("@type");
+        if (narrower || nested || (wrapsOperand && subject.end <= g)) {
+          file.edits.push({ start: j, end: j, text: "(" });
+          file.edits.push({ start: g, end: g, text: `${asText})` });
+          file.annotations.push({
+            line: file.lineOf(j),
+            symbol,
+            action: `cast${asText}`,
+          });
+          file.consumedTags.add(ckey);
+          consumeCastComment(file, comment, tag);
+          continue;
+        }
+      }
+    }
+    if (wrapsOperand) {
+      file.leave("unsupported-cast");
+      continue;
+    }
+    wraps.push({ comment, tag, ckey, asText });
+  }
+  // Stacked casts on one subject nest in source order (`/** {A} */ /** {B} */`
+  // becomes `((x as B) as A)`): opens emit first, closers in reverse.
+  for (let k = 0; k < wraps.length; k++) {
+    file.edits.push({ start: subject.start, end: subject.start, text: "(" });
+  }
+  for (let i = wraps.length - 1; i >= 0; i--) {
+    const w = wraps[i];
+    file.edits.push({
+      start: subject.end,
+      end: subject.end,
+      text: `${w.asText})`,
+    });
+    file.annotations.push({
+      line: file.lineOf(subject.start),
+      symbol,
+      action: `cast${w.asText}`,
+    });
+    file.consumedTags.add(w.ckey);
+    consumeCastComment(file, w.comment, w.tag);
+  }
+}
+
+/**
+ * Converts `@type` on one object-literal property: the value carries the
+ * assertion, as in checkJs (`{key: value as T}`).
+ * @param {FileConvert} file conversion state
+ * @param {object} path Babel path of the property node
+ * @returns {void}
+ */
+function convertObjectPropType(file, path) {
+  const node = path.node;
+  if (path.parent.type !== "ObjectExpression") return;
+  const value = node.value;
+  if (
+    !value ||
+    value.type === "FunctionExpression" ||
+    value.type === "ArrowFunctionExpression"
+  ) {
+    return;
+  }
+  const keyName =
+    node.computed || node.key.type !== "Identifier"
+      ? "(computed)"
+      : node.key.name;
+  if (node.shorthand) {
+    const comment = ownerDoc(path);
+    if (comment === null) return;
+    const { tags } = docTags(file, comment);
+    if (
+      tags.some(
+        (t) =>
+          t.kind === "type" &&
+          !file.consumedTags.has(`${comment.start}:${t.at}`),
+      )
+    ) {
+      file.leave("shorthand-@type");
+    }
+    return;
+  }
+  const comment = ownerDoc(path);
+  if (comment === null) return;
+  const { tags, bodyStart, bodyEnd } = docTags(file, comment);
+  const key = `${comment.start}`;
+  const tag = tags.find(
+    (t) =>
+      t.kind === "type" &&
+      t.brace !== null &&
+      !file.consumedTags.has(`${key}:${t.at}`),
+  );
+  if (tag === undefined) return;
+  const mapped = mapJsType(tag.brace.text);
+  if (mapped === null) {
+    file.leave("invalid-type");
+    return;
+  }
+  file.insert(
+    value.end,
+    ` as ${mapped}`,
+    `${keyName} (property)`,
+    `prop as ${mapped}`,
+  );
+  file.consumedTags.add(`${key}:${tag.at}`);
+  cleanTypeTag(file, comment, tag, true, bodyStart, bodyEnd);
 }
 
 /**
@@ -714,6 +1349,7 @@ class FileConvert {
     this.cleanedTags = 0;
     this.left = {};
     this.consumedTags = new Set();
+    this.classRanges = [];
   }
 
   /**
@@ -1164,13 +1800,64 @@ function convertFunction(file, path) {
   const node = path.node;
   const kind = fnKind(node);
   const symbol = `${fnName(node)} (${kind})`;
-  const comment = ownerDoc(path);
+  const comment = ownerDoc(path) ?? statementCallbackDoc(file, path);
   if (comment !== null) {
     const { tags, bodyStart, bodyEnd } = docTags(file, comment);
     const key = `${comment.start}`;
     const isTpl = (t) => t.kind === "template";
     const isRet = (t) =>
       (t.kind === "returns" || t.kind === "return") && t.brace !== null;
+
+    // @this -> this param (never on arrows, constructors, getters, setters).
+    if (
+      node.type !== "ArrowFunctionExpression" &&
+      kind !== "constructor" &&
+      kind !== "get" &&
+      kind !== "set"
+    ) {
+      const first = node.params[0];
+      const explicit =
+        first !== undefined &&
+        first.type === "Identifier" &&
+        first.name === "this";
+      if (!explicit) {
+        const ti = tags.findIndex(
+          (t) =>
+            t.kind === "this" &&
+            t.brace !== null &&
+            !file.consumedTags.has(`${key}:${t.at}`),
+        );
+        if (ti !== -1) {
+          const mapped = mapJsType(tags[ti].brace.text);
+          if (mapped !== null) {
+            if (node.params.length > 0) {
+              file.insert(
+                first.start,
+                `this: ${mapped}, `,
+                symbol,
+                `this: ${mapped}`,
+              );
+            } else {
+              const open = parenBefore(file, node);
+              if (open === null) {
+                file.leave("no-this-anchor");
+              } else {
+                file.insert(
+                  open + 1,
+                  `this: ${mapped}`,
+                  symbol,
+                  `this: ${mapped}`,
+                );
+              }
+            }
+            file.consumedTags.add(`${key}:${tags[ti].at}`);
+            cleanTypeTag(file, comment, tags[ti], true, bodyStart, bodyEnd);
+          } else {
+            file.leave("invalid-this");
+          }
+        }
+      }
+    }
 
     if (node.typeParameters === null || node.typeParameters === undefined) {
       if (allowsTemplate(node)) {
@@ -1222,8 +1909,8 @@ function convertFunction(file, path) {
         file.leave("already-annotated");
         continue;
       }
-      const type = t.brace.text.trim();
-      if (!validReturnType(type)) {
+      const type = mapReturnType(t.brace.text, kind);
+      if (type === null) {
         file.leave("invalid-type");
         continue;
       }
@@ -1323,8 +2010,8 @@ function convertInlineParamTypes(file, path, symbol) {
     if (inner.length !== 1 || inner[0].kind !== "type") continue;
     const brace = inner[0].brace;
     if (brace === null) continue;
-    const type = brace.text.trim();
-    if (!validType(type)) {
+    const type = mapJsType(brace.text);
+    if (type === null) {
       file.leave("invalid-type");
       continue;
     }
@@ -1415,17 +2102,23 @@ function convertParams(
     ) {
       // `@param {object} opts` says nothing: the documented shape is the
       // sub-tags. Annotating `object` would reject every `opts.key` (TS2339)
-      if (
-        subIndexes.some((j) => decoded[j].info.sub.length > 1) ||
-        subIndexes.some((j) => !validType(decoded[j].tag.brace.text.trim()))
-      ) {
+      if (subIndexes.some((j) => decoded[j].info.sub.length > 1)) {
         file.leave("pattern-incomplete");
         return;
+      }
+      const subMapped = new Map();
+      for (const j of subIndexes) {
+        const mapped = mapJsType(decoded[j].tag.brace.text);
+        if (mapped === null) {
+          file.leave("pattern-incomplete");
+          return;
+        }
+        subMapped.set(j, mapped);
       }
       const entries = subIndexes.map((j) => {
         const s = decoded[j];
         const opt = s.info.optional ? "?" : "";
-        return `${propText(s.info.sub[0])}${opt}: ${s.tag.brace.text.trim()}`;
+        return `${propText(s.info.sub[0])}${opt}: ${subMapped.get(j)}`;
       });
       const annotation = `{ ${entries.join(", ")} }`;
       if (!validType(annotation)) {
@@ -1448,7 +2141,12 @@ function convertParams(
     if (c.isRest) {
       const m = /^\.\.\.(.*)$/s.exec(rawType);
       const inner = (m !== null ? m[1] : rawType).trim();
-      const annotation = m !== null ? `${inner}[]` : inner;
+      const mappedInner = mapJsType(inner);
+      if (mappedInner === null) {
+        file.leave("invalid-type");
+        return;
+      }
+      const annotation = m !== null ? `${mappedInner}[]` : mappedInner;
       if (!validType(annotation)) {
         file.leave("invalid-type");
         return;
@@ -1459,12 +2157,13 @@ function convertParams(
         file.leave("invalid-type");
         return;
       }
-      if (!validType(rawType)) {
+      const annotation = mapJsType(rawType);
+      if (annotation === null) {
         file.leave("invalid-type");
         return;
       }
       const optional = d.info.optional && !c.hasDefault && !opts.isSetter;
-      annotateIdentifier(file, node, symbol, c, rawType, optional);
+      annotateIdentifier(file, node, symbol, c, annotation, optional);
     }
     used.add(i);
     file.consumedTags.add(`${key}:${d.tag.at}`);
@@ -1498,9 +2197,12 @@ function convertParams(
       if (c.isRest) {
         const m = /^\.\.\.(.*)$/s.exec(rawType);
         const inner = (m !== null ? m[1] : rawType).trim();
-        annotation = m !== null ? `${inner}[]` : inner;
+        const mappedInner = mapJsType(inner);
+        if (mappedInner !== null) {
+          annotation = m !== null ? `${mappedInner}[]` : mappedInner;
+        }
       } else if (!rawType.startsWith("...")) {
-        annotation = rawType;
+        annotation = mapJsType(rawType);
       }
       if (annotation !== null && validType(annotation)) {
         annotateIdentifier(file, node, symbol, c, annotation, false);
@@ -1640,16 +2342,17 @@ function convertPattern(
       const rawType = tops[0].tag.brace.text.trim();
       // Rest markers belong on rest elements: strip them there, refuse them
       // on plain patterns instead of emitting invalid syntax
-      let type = rawType;
+      let type = mapJsType(rawType);
       if (c.isRest === true) {
         const m = /^\.\.\.(.*)$/s.exec(rawType);
         const inner = (m !== null ? m[1] : rawType).trim();
-        type = m !== null ? `${inner}[]` : inner;
+        const mappedInner = mapJsType(inner);
+        type = mappedInner === null ? null : m !== null ? `${mappedInner}[]` : mappedInner;
       } else if (rawType.startsWith("...")) {
         file.leave("invalid-type");
         return;
       }
-      if (!validType(type)) {
+      if (type === null || !validType(type)) {
         file.leave("invalid-type");
         return;
       }
@@ -1720,9 +2423,14 @@ function convertPattern(
     const [[topName, list]] = [...groups];
     const top = tops.find((d) => d.info.top === topName) ?? null;
     const byName = new Map(list.map((d) => [d.info.sub[0], d]));
+    const subMapped = new Map();
     const covers = props.every((p) => {
       const d = byName.get(p.name);
-      return d !== undefined && validType(d.tag.brace.text.trim());
+      if (d === undefined) return false;
+      const mapped = mapJsType(d.tag.brace.text);
+      if (mapped === null) return false;
+      subMapped.set(p.name, mapped);
+      return true;
     });
     if (
       (top === null || isBareObject(top.tag.brace.text)) &&
@@ -1731,7 +2439,7 @@ function convertPattern(
     ) {
       const entries = props.map((p) => {
         const d = byName.get(p.name);
-        const type = d.tag.brace.text.trim();
+        const type = subMapped.get(p.name);
         const opt = d.info.optional || p.hasDefault || c.hasDefault ? "?" : "";
         return `${propText(p.name)}${opt}: ${type}`;
       });
@@ -1760,8 +2468,8 @@ function convertPattern(
       return;
     }
     if (top !== null && !isBareObject(top.tag.brace.text)) {
-      const type = top.tag.brace.text.trim();
-      if (!validType(type)) {
+      const type = mapJsType(top.tag.brace.text);
+      if (type === null || !validType(type)) {
         file.leave("invalid-type");
         return;
       }
@@ -1776,12 +2484,13 @@ function convertPattern(
   }
 
   if (tops.length === 1 && subs.length === 0) {
-    const type = tops[0].tag.brace.text.trim();
-    if (isBareObject(type)) {
+    const rawType = tops[0].tag.brace.text.trim();
+    if (isBareObject(rawType)) {
       file.leave("bare-object-pattern");
       return;
     }
-    if (!validType(type)) {
+    const type = mapJsType(tops[0].tag.brace.text);
+    if (type === null || !validType(type)) {
       file.leave("invalid-type");
       return;
     }
@@ -1844,6 +2553,473 @@ function convertField(file, path) {
 }
 
 /**
+ * One-line description of a tag: text after the name, `*` prefixes stripped,
+ * whitespace collapsed, comment closers escaped.
+ * @param {FileConvert} file conversion state
+ * @param {object} tag parsed tag
+ * @returns {string} description, or "" when none
+ */
+function tagDescLine(file, tag) {
+  const text = file.src
+    .slice(tag.nameEnd, tag.end)
+    .replace(/\r?\n[ \t]*\*[ \t]?/g, " ")
+    .replace(/[\s*]+$/, "")
+    .trim();
+  return text.replace(/\*\//g, "* /");
+}
+
+/**
+ * Description lines above the first tag of a comment.
+ * @param {FileConvert} file conversion state
+ * @param {object} comment comment node
+ * @param {object[]} tags parsed tags of the comment
+ * @returns {string[]} prose lines
+ */
+function blockProse(file, comment, tags) {
+  const firstAt = tags.length > 0 ? tags[0].at : comment.end - 2;
+  return file.src
+    .slice(comment.start + 2, firstAt)
+    .split("\n")
+    .map((l) => l.replace(/^[ \t]*\*?[ \t]?/, "").replace(/\s+$/, ""))
+    .filter((l) => l !== "");
+}
+
+/**
+ * Doc comment for a generated declaration.
+ * @param {string[]} prose description lines
+ * @returns {string} `/** ... *\/` block with trailing newline, or ""
+ */
+function proseDoc(prose) {
+  if (prose.length === 0) return "";
+  const safe = prose.map((l) => l.replace(/\*\//g, "* /"));
+  return `/**\n${safe.map((l) => ` * ${l}`.trimEnd()).join("\n")}\n */\n`;
+}
+
+/**
+ * Whether snippet text parses as TypeScript.
+ * @param {string} text candidate declaration text
+ * @returns {boolean} true when parseable
+ */
+function validDecl(text) {
+  try {
+    parse(text, { plugins: ["typescript"] });
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Builds the declaration text for one `@typedef`/`@callback` block.
+ * Object shapes become interfaces (same-name interfaces merge across the
+ * global scripts, while duplicate `type` aliases would collide); unions and
+ * other aliases become `type` declarations.
+ * @param {FileConvert} file conversion state
+ * @param {object} comment comment node
+ * @returns {{name: string, kind: string, text: string, tags: number}|null}
+ *   declaration with its tag count, or null when it stays JSDoc (counted)
+ */
+function buildTypedefDecl(file, comment) {
+  const bodyStart = comment.start + 2;
+  const bodyEnd = comment.end - 2;
+  const tags = parseTags(file.src.slice(bodyStart, bodyEnd), bodyStart);
+  const defs = tags.filter((t) => t.kind === "typedef" || t.kind === "callback");
+  if (defs.length !== 1) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  const def = defs[0];
+  const prose = blockProse(file, comment, tags);
+  const doc = proseDoc(prose);
+  if (def.kind === "callback") {
+    if (def.brace !== null) {
+      file.leave("invalid-typedef");
+      return null;
+    }
+    const name = def.rawName.replace(/^\[|\]$/g, "");
+    if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+      file.leave("invalid-typedef");
+      return null;
+    }
+    const params = [];
+    let ret = "void";
+    for (const t of tags) {
+      if (t === def) continue;
+      if (t.kind === "param" || t.kind === "arg" || t.kind === "argument") {
+        if (t.brace === null) {
+          file.leave("invalid-typedef");
+          return null;
+        }
+        const rawName = t.rawName.trimStart();
+        const restMarker = rawName.startsWith("...");
+        const info = decodeName(rawName);
+        if (info.sub.length > 0) {
+          file.leave("invalid-typedef");
+          return null;
+        }
+        const mapped = mapJsType(t.brace.text);
+        if (mapped === null) {
+          file.leave("invalid-typedef");
+          return null;
+        }
+        const ann = restMarker ? `${mapped}[]` : mapped;
+        if (!validType(ann)) {
+          file.leave("invalid-typedef");
+          return null;
+        }
+        params.push(
+          `${restMarker ? "..." : ""}${info.name}${info.optional ? "?" : ""}: ${ann}`,
+        );
+      } else if (t.kind === "returns" || t.kind === "return") {
+        if (t.brace === null) continue;
+        const mapped = mapReturnType(t.brace.text, "function");
+        if (mapped !== null) ret = mapped;
+      }
+    }
+    const text = `${doc}type ${name} = (${params.join(", ")}) => ${ret};`;
+    if (!validDecl(text)) {
+      file.leave("invalid-typedef");
+      return null;
+    }
+    return { name, kind: "callback", text, tags: tags.length };
+  }
+  if (def.brace === null) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  const rawType = def.brace.text;
+  const name = def.rawName.replace(/^\[|\]$/g, "");
+  if (!/^[A-Za-z_$][\w$]*$/.test(name)) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  const props = tags.filter((t) => t.kind === "property" || t.kind === "prop");
+  if (/^\s*object\s*$/i.test(rawType) && props.length > 0) {
+    const members = [];
+    for (const t of props) {
+      if (t.brace === null) {
+        file.leave("invalid-typedef");
+        return null;
+      }
+      const info = decodeName(t.rawName);
+      if (info.rest || info.sub.length > 0) {
+        file.leave("nested-typedef-prop");
+        return null;
+      }
+      const mapped = mapJsType(t.brace.text);
+      if (mapped === null) {
+        file.leave("invalid-typedef");
+        return null;
+      }
+      const desc = tagDescLine(file, t);
+      members.push(
+        `${desc === "" ? "" : `/** ${desc} */ `}${info.name}${
+          info.optional || info.hasDefault ? "?" : ""
+        }: ${mapped};`,
+      );
+    }
+    const text = `${doc}interface ${name} {\n${members.map((m) => `  ${m}`).join("\n")}\n}`;
+    if (!validDecl(text)) {
+      file.leave("invalid-typedef");
+      return null;
+    }
+    return { name, kind: "interface", text, tags: tags.length };
+  }
+  if (props.length > 0) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  const mapped = mapJsType(rawType);
+  if (mapped === null) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  const t0 = mapped.trim();
+  // An object literal body doubles as an interface body, so same-name
+  // declarations merge instead of colliding. Anything else (unions,
+  // intersections, references) stays a `type` alias exactly as written:
+  // decomposing it would drop unresolvable parts and spread errors to
+  // every use site, while checkJs contains the failure at the declaration.
+  if (t0.startsWith("{")) {
+    const cand = `${doc}interface ${name} ${t0}`;
+    if (validDecl(cand)) return { name, kind: "interface", text: cand, tags: tags.length };
+  }
+  const text = `${doc}type ${name} = ${mapped};`;
+  if (!validDecl(text)) {
+    file.leave("invalid-typedef");
+    return null;
+  }
+  return { name, kind: "type", text, tags: tags.length };
+}
+
+/**
+ * Converts `@typedef`/`@callback` blocks into declarations. Standalone
+ * blocks are replaced in place; blocks inside class bodies (where types are
+ * illegal) move before the innermost containing class statement.
+ * @param {FileConvert} file conversion state
+ * @param {object} ast parsed file
+ * @returns {void}
+ */
+function convertTypedefs(file, ast) {
+  for (const comment of ast.comments ?? []) {
+    if (comment.type !== "CommentBlock") continue;
+    if (!comment.value.trimStart().startsWith("*")) continue;
+    if (!/@(?:typedef|callback)\b/.test(comment.value)) continue;
+    const decl = buildTypedefDecl(file, comment);
+    if (decl === null) continue;
+    // A declaration spliced mid-line would glue onto code: only standalone
+    // blocks convert.
+    const after = file.src.slice(comment.end).match(/^[ \t]*(\r?\n|$)/);
+    if (after === null) {
+      file.leave("invalid-typedef");
+      continue;
+    }
+    let holder = null;
+    for (const r of file.classRanges) {
+      if (r.start <= comment.start && comment.end <= r.end) {
+        if (holder === null || r.end - r.start < holder.end - holder.start) {
+          holder = r;
+        }
+      }
+    }
+    if (holder === null) {
+      file.edits.push({
+        start: comment.start,
+        end: comment.end,
+        text: decl.text,
+      });
+    } else {
+      file.removeComment(comment);
+      const lineIdx = file.lineOf(holder.stmtStart) - 1;
+      const at = file.lineStarts[lineIdx];
+      file.edits.push({ start: at, end: at, text: `${decl.text}\n` });
+    }
+    file.annotations.push({
+      line: file.lineOf(comment.start),
+      symbol: `${decl.name} (typedef)`,
+      action: `typedef ${decl.kind}`,
+    });
+    file.cleanedTags += decl.tags;
+  }
+}
+
+/**
+ * `@param` types of one method, for `this.x = ident` right-hand sides.
+ * @param {FileConvert} file conversion state
+ * @param {object} method method node
+ * @returns {Map<string, string>} parameter name to mapped type
+ */
+function methodParamTypes(file, method) {
+  const paramTypes = new Map();
+  const doc = (method.leadingComments ?? [])
+    .filter(
+      (c) =>
+        c.type === "CommentBlock" &&
+        c.value.trimStart().startsWith("*") &&
+        !EXCLUDED_BLOCK.test(c.value),
+    )
+    .at(-1);
+  if (doc === undefined) return paramTypes;
+  const tags = parseTags(
+    file.src.slice(doc.start + 2, doc.end - 2),
+    doc.start + 2,
+  );
+  for (const t of tags) {
+    if (
+      (t.kind === "param" || t.kind === "arg" || t.kind === "argument") &&
+      t.brace !== null
+    ) {
+      const info = decodeName(t.rawName);
+      if (info.sub.length > 0 || paramTypes.has(info.top)) continue;
+      const mapped = mapJsType(t.brace.text);
+      if (mapped !== null) paramTypes.set(info.top, mapped);
+    }
+  }
+  return paramTypes;
+}
+
+/**
+ * Type for a `this.name` field from every direct assignment in the class:
+ * a hanging `@type` wins, then the assigned parameter's type, a `new`
+ * expression's class, a literal, skipping `null`/`undefined` initializers
+ * for later values. Anything else is evolving `any`, as in checkJs.
+ * @param {FileConvert} file conversion state
+ * @param {string} name field name
+ * @param {{method: object, stmt: object}[]} uses assignments in order
+ * @returns {string|null} field type, or null when it stays undeclared
+ */
+function thisFieldType(file, name, uses) {
+  void name;
+  const paramCache = new Map();
+  for (const { method, stmt } of uses) {
+    const rhs = stmt.expression.right;
+    // (a) a hanging `/** @type */` on the statement.
+    const lead = (stmt.leadingComments ?? [])
+      .filter(
+        (c) =>
+          c.type === "CommentBlock" &&
+          c.value.trimStart().startsWith("*") &&
+          !EXCLUDED_BLOCK.test(c.value),
+      )
+      .reverse();
+    for (const c of lead) {
+      const inner = parseTags(
+        file.src.slice(c.start + 2, c.end - 2),
+        c.start + 2,
+      );
+      if (inner.length === 1 && inner[0].kind === "type") {
+        const ckey = `${c.start}:${inner[0].at}`;
+        if (file.consumedTags.has(ckey)) continue;
+        if (inner[0].brace === null) break;
+        const mapped = mapJsType(inner[0].brace.text);
+        if (mapped === null) {
+          file.leave("invalid-type");
+          return null;
+        }
+        file.consumedTags.add(ckey);
+        consumeCastComment(file, c, inner[0]);
+        return mapped;
+      }
+    }
+    // (b) the assigned parameter's type.
+    if (rhs.type === "Identifier") {
+      if (!paramCache.has(method)) {
+        paramCache.set(method, methodParamTypes(file, method));
+      }
+      const found = paramCache.get(method).get(rhs.name);
+      if (found !== undefined) return found;
+      continue;
+    }
+    // Nullish initializers say nothing: a later value may still type it.
+    if (
+      rhs.type === "NullLiteral" ||
+      (rhs.type === "Identifier" && rhs.name === "undefined") ||
+      (rhs.type === "UnaryExpression" &&
+        rhs.operator === "void" &&
+        rhs.prefix)
+    ) {
+      continue;
+    }
+    // (c) literals and `new` expressions.
+    if (rhs.type === "BooleanLiteral") return "boolean";
+    if (rhs.type === "StringLiteral") return "string";
+    if (rhs.type === "NumericLiteral") return "number";
+    if (rhs.type === "TemplateLiteral") return "string";
+    if (
+      rhs.type === "NewExpression" &&
+      rhs.callee.type === "Identifier" &&
+      validType(rhs.callee.name)
+    ) {
+      return rhs.callee.name;
+    }
+  }
+  return "any";
+}
+
+/**
+ * Inserts `declare x: T` fields for `this.x = ...` assignments in class
+ * methods that declare nothing. `declare` emits no code, so behavior never
+ * changes while tsc stops reporting the property as missing (TS2339).
+ * @param {FileConvert} file conversion state
+ * @param {object} path Babel path of the class node
+ * @returns {void}
+ */
+function convertDeclareFields(file, path) {
+  const cls = path.node;
+  if (cls.body.type !== "ClassBody") return;
+  const className =
+    cls.id !== null && cls.id !== undefined ? cls.id.name : "(anonymous)";
+  const declared = new Set();
+  for (const el of cls.body.body) {
+    if (
+      (el.type === "ClassProperty" || el.type === "ClassMethod") &&
+      el.key.type === "Identifier"
+    ) {
+      declared.add(el.key.name);
+    }
+    if (
+      el.type === "ClassPrivateProperty" ||
+      el.type === "ClassPrivateMethod"
+    ) {
+      declared.add(`#${el.key.id.name}`);
+    }
+  }
+  const lines = [];
+  // All direct `this.name = rhs` statements per field, in order: a field
+  // first set to `null` and later to a value takes the value's type.
+  const assignments = new Map();
+  for (const el of cls.body.body) {
+    if (el.type !== "ClassMethod" && el.type !== "ClassPrivateMethod") continue;
+    if (!el.body || el.body.type !== "BlockStatement") continue;
+    for (const st of el.body.body) {
+      if (
+        st.type !== "ExpressionStatement" ||
+        st.expression.type !== "AssignmentExpression" ||
+        st.expression.operator !== "="
+      ) {
+        continue;
+      }
+      const l = st.expression.left;
+      if (
+        l.type !== "MemberExpression" ||
+        l.object.type !== "ThisExpression" ||
+        l.computed ||
+        l.property.type !== "Identifier"
+      ) {
+        continue;
+      }
+      const name = l.property.name;
+      if (declared.has(name)) continue;
+      const list = assignments.get(name) ?? [];
+      list.push({ method: el, stmt: st });
+      assignments.set(name, list);
+    }
+  }
+  for (const [name, uses] of assignments) {
+    declared.add(name);
+    const first = uses[0];
+    const typeText = thisFieldType(file, name, uses);
+    // Bad `@type` is already counted inside; anything else is valid by
+    // construction, so this guard only fires on a bug.
+    if (typeText === null || !validType(typeText)) {
+      if (typeText !== null) file.leave("this-field-untyped");
+      continue;
+    }
+    lines.push({
+      name,
+      type: typeText,
+      isStatic: !!first.method.static,
+    });
+  }
+  if (lines.length === 0) return;
+  let indent = "  ";
+  const first = cls.body.body[0];
+  if (first !== undefined) {
+    const li = file.lineOf(first.start) - 1;
+    const m = /^[ \t]*/.exec(file.src.slice(file.lineStarts[li], first.start));
+    if (m !== null && m[0] !== "") indent = m[0];
+  }
+  const text = lines
+    .map(
+      ({ name, type, isStatic }) =>
+        `\n${indent}declare ${isStatic ? "static " : ""}${name}: ${type};`,
+    )
+    .join("");
+  file.edits.push({
+    start: cls.body.start + 1,
+    end: cls.body.start + 1,
+    text,
+  });
+  for (const { name, type } of lines) {
+    file.annotations.push({
+      line: file.lineOf(cls.body.start),
+      symbol: `${className} (class)`,
+      action: `declare ${name}: ${type}`,
+    });
+  }
+}
+
+/**
  * Converts `@type` on a variable declarator or class field.
  * @param {FileConvert} file conversion state
  * @param {object} path Babel path of the declarator or field node
@@ -1870,8 +3046,8 @@ function convertVarType(file, path, symbol, anchor, alreadyAnnotated) {
     file.leave("no-@type");
     return;
   }
-  const type = tag.brace.text.trim();
-  if (!validType(type)) {
+  const type = mapJsType(tag.brace.text);
+  if (type === null) {
     file.leave("invalid-type");
     return;
   }
@@ -1920,6 +3096,9 @@ function convertFile(filePath, rel) {
   }
   const file = new FileConvert(src, rel);
   traverse(ast, {
+    enter(path) {
+      convertCasts(file, path);
+    },
     FunctionDeclaration(path) {
       convertFunction(file, path);
     },
@@ -1993,7 +3172,34 @@ function convertFile(filePath, rel) {
     ClassPrivateProperty(path) {
       convertField(file, path);
     },
+    ObjectProperty(path) {
+      convertObjectPropType(file, path);
+    },
+    Class(path) {
+      let top = path;
+      while (
+        top.parentPath &&
+        (top.parent.type === "VariableDeclarator" ||
+          top.parent.type === "VariableDeclaration" ||
+          top.parent.type === "AssignmentExpression" ||
+          top.parent.type === "ExportNamedDeclaration" ||
+          top.parent.type === "ExportDefaultDeclaration")
+      ) {
+        top = top.parentPath;
+      }
+      file.classRanges.push({
+        start: path.node.start,
+        end: path.node.end,
+        stmtStart: top.node.start,
+      });
+    },
   });
+  traverse(ast, {
+    Class(path) {
+      convertDeclareFields(file, path);
+    },
+  });
+  convertTypedefs(file, ast);
   file.finalize();
   return { rel, file, error: null };
 }
